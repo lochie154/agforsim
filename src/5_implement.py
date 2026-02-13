@@ -1,159 +1,314 @@
 #!/usr/bin/env python3
 """
-Generate Python component stubs from markdown.
+Step 5 — Generate standalone Python function stubs from component markdown.
+
+Creates minimal, runnable Python files from extracted components.
+No external dependencies (no agforsim.* imports).
 
 Usage:
     python 5_implement.py biomass_from_dbh
-    python 5_implement.py --all --category growth
+    python 5_implement.py --all
+    python 5_implement.py --status
 """
+
+from __future__ import annotations
 
 import argparse
 import re
 from pathlib import Path
+from typing import Optional
 
-# TODO:
-# - [ ] Parse component frontmatter
-# - [ ] Generate Component subclass skeleton
-# - [ ] Map inputs to Parameter objects
-# - [ ] Insert original code as comment
-# - [ ] Insert pseudocode as docstring
-# - [ ] Write to src/agforsim/components/{category}/
-# - [ ] Auto-detect category from component location
+from _shared import (
+    COMPONENTS_DIR,
+    OUTPUT_DIR,
+    resolve_vault,
+    parse_frontmatter,
+)
 
 
-def parse_frontmatter(filepath: Path) -> dict | None:
-    """Parse YAML frontmatter."""
+# ── stub generation ───────────────────────────────────────────────────────────
+
+def extract_original_code(filepath: Path) -> Optional[str]:
+    """Extract original code block from component markdown."""
     try:
-        content = filepath.read_text()
-        if not content.startswith("---"):
-            return None
-        end = content.find("\n---\n", 3)
-        if end == -1:
-            return None
-        import yaml
-        fm = yaml.safe_load(content[3:end])
-        
-        # Also extract code blocks
-        code_match = re.search(r'## Original Code\s+```\w*\n(.+?)```', content, re.DOTALL)
-        if code_match:
-            fm["_original_code"] = code_match.group(1).strip()
-        
-        return fm
-    except:
-        return None
+        content = filepath.read_text(encoding="utf-8")
+        # Look for code block in "Original Code" or "Source Code" section
+        match = re.search(
+            r'##\s*(?:Original|Source)\s*Code\s+```\w*\n(.+?)```',
+            content,
+            re.DOTALL | re.IGNORECASE,
+        )
+        if match:
+            return match.group(1).strip()
+    except Exception:
+        pass
+    return None
 
 
-def generate_stub(fm: dict) -> str:
-    """Generate Python component stub."""
+def _tool_name(source_tool: str) -> str:
+    """Extract tool name from wikilink format."""
+    if not source_tool:
+        return "unknown"
+    m = re.search(r"\[\[([^\]/]+)\]\]", str(source_tool))
+    if m:
+        return m.group(1)
+    m = re.search(r"\[\[tools/(.+?)\]\]", str(source_tool))
+    if m:
+        return m.group(1)
+    return str(source_tool).strip() or "unknown"
+
+
+def generate_stub(fm: dict, original_code: Optional[str] = None) -> str:
+    """Generate a standalone Python function stub."""
     name = fm.get("name", "unknown")
-    tool = re.search(r'\[\[tools/(.+?)\]\]', str(fm.get("source_tool", "")))
-    tool = tool.group(1) if tool else "unknown"
-    
-    # Generate input schema
-    inputs_code = ""
-    for inp in fm.get("inputs", []) or []:
-        if isinstance(inp, dict):
-            n = inp.get("name", "x")
-            inputs_code += f'            "{n}": Parameter("{n}", float),\n'
-    
-    # Generate output schema
-    outputs_code = ""
-    for out in fm.get("outputs", []) or []:
-        if isinstance(out, dict):
-            n = out.get("name", "result")
-            outputs_code += f'            "{n}": Parameter("{n}", float),\n'
-    
-    original = fm.get("_original_code", "# No original code found")
-    
-    return f'''"""
-{name} - extracted from {tool}
+    tool = _tool_name(fm.get("source_tool", ""))
 
-PROVENANCE:
-- Source: {fm.get("source_file", "unknown")}
-- Lines: {fm.get("source_lines", "unknown")}
-- Language: {fm.get("source_language", "unknown")}
+    # Build input params
+    inputs = fm.get("inputs", []) or []
+    params = []
+    for inp in inputs:
+        if isinstance(inp, dict):
+            pname = inp.get("name", "x")
+            ptype = inp.get("type", "float")
+            # Normalize type to Python type hint
+            ptype_hint = _normalize_type(ptype)
+            params.append(f"{pname}: {ptype_hint}")
+
+    param_str = ", ".join(params) if params else ""
+
+    # Build output type
+    outputs = fm.get("outputs", []) or []
+    if len(outputs) == 1 and isinstance(outputs[0], dict):
+        out_type = _normalize_type(outputs[0].get("type", "float"))
+    elif len(outputs) > 1:
+        out_type = "dict"
+    else:
+        out_type = "float"
+
+    # Format original code as comment block
+    code_comment = ""
+    if original_code:
+        code_lines = original_code.split("\n")
+        code_comment = "\n".join(f"    # {line}" for line in code_lines)
+        code_comment = f"\n    # Original ({fm.get('source_language', 'unknown')}):\n{code_comment}\n"
+
+    # Build docstring
+    docstring_parts = [f'"""{name}']
+    if fm.get("description"):
+        docstring_parts.append(f"\n    {fm.get('description')}")
+
+    docstring_parts.append(f"\n\n    Extracted from: {tool}")
+    docstring_parts.append(f"\n    Source file: {fm.get('source_file', 'unknown')}")
+    docstring_parts.append(f"\n    Source lines: {fm.get('source_lines', 'unknown')}")
+    docstring_parts.append(f"\n    Language: {fm.get('source_language', 'unknown')}")
+
+    if inputs:
+        docstring_parts.append("\n\n    Args:")
+        for inp in inputs:
+            if isinstance(inp, dict):
+                pname = inp.get("name", "x")
+                desc = inp.get("description", "")
+                unit = inp.get("unit", "")
+                docstring_parts.append(f"\n        {pname}: {desc}")
+                if unit:
+                    docstring_parts.append(f" [{unit}]")
+
+    if outputs:
+        docstring_parts.append("\n\n    Returns:")
+        for out in outputs:
+            if isinstance(out, dict):
+                oname = out.get("name", "result")
+                desc = out.get("description", "")
+                unit = out.get("unit", "")
+                docstring_parts.append(f"\n        {oname}: {desc}")
+                if unit:
+                    docstring_parts.append(f" [{unit}]")
+
+    docstring_parts.append('\n    """')
+    docstring = "".join(docstring_parts)
+
+    return f'''#!/usr/bin/env python3
+"""
+Stub for {name} — extracted from {tool}
+
+This is a standalone function stub. Implement the logic based on the
+original code comments below.
+
+Generated by AGFORSIM extraction pipeline.
 """
 
-from agforsim.core.component import Component, ComponentMeta
-from agforsim.core.parameter import Parameter
-from agforsim.core.registry import registry
+
+def {name}({param_str}) -> {out_type}:
+    {docstring}
+{code_comment}
+    # TODO: Implement this function
+    raise NotImplementedError("{name} not yet implemented")
 
 
-@registry.component("growth")  # TODO: correct category
-class {name.title().replace("_", "")}(Component):
-    """
-    TODO: Add description
-    
-    Original code:
-    ```
-{original}
-    ```
-    """
-    
-    meta = ComponentMeta(
-        name="{name}",
-        source_tool="{tool}",
-        source_file="{fm.get("source_file", "")}",
-        source_lines="{fm.get("source_lines", "")}",
-        source_language="{fm.get("source_language", "")}",
-    )
-    
-    @property
-    def input_schema(self):
-        return {{
-{inputs_code}        }}
-    
-    @property
-    def output_schema(self):
-        return {{
-{outputs_code}        }}
-    
-    def run(self, inputs: dict) -> dict:
-        """
-        TODO: Implement from original code
-        """
-        # TODO: translate original code
-        raise NotImplementedError()
+if __name__ == "__main__":
+    # Quick test
+    # result = {name}(...)
+    # print(result)
+    pass
 '''
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Generate component stubs")
-    parser.add_argument("name", nargs="?", help="Component name")
-    parser.add_argument("--all", action="store_true", help="Generate all")
-    parser.add_argument("--vault", type=Path, default=Path(".."))
-    parser.add_argument("--output", type=Path, help="Output directory")
-    
+def _normalize_type(type_str: str) -> str:
+    """Normalize type string to Python type hint."""
+    if not type_str:
+        return "float"
+    t = str(type_str).lower().strip()
+    mapping = {
+        "numeric": "float",
+        "number": "float",
+        "integer": "int",
+        "int": "int",
+        "boolean": "bool",
+        "bool": "bool",
+        "string": "str",
+        "str": "str",
+        "array": "list",
+        "list": "list",
+        "vector": "list",
+        "matrix": "list[list]",
+        "dataframe": "dict",
+        "dict": "dict",
+        "object": "dict",
+    }
+    return mapping.get(t, "float")
+
+
+# ── commands ──────────────────────────────────────────────────────────────────
+
+def cmd_generate(vault: Path, name: str, output_dir: Path) -> None:
+    """Generate stub for a specific component."""
+    comp_dir = vault / COMPONENTS_DIR
+    if not comp_dir.exists():
+        print(f"Components directory not found: {comp_dir}")
+        return
+
+    # Find matching component(s)
+    matches = list(comp_dir.rglob(f"*{name}*.md"))
+    if not matches:
+        print(f"No component matching '{name}' found.")
+        return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    for match in matches:
+        fm = parse_frontmatter(match)
+        if not fm:
+            print(f"  Skipped (no frontmatter): {match.name}")
+            continue
+
+        original_code = extract_original_code(match)
+        stub = generate_stub(fm, original_code)
+
+        comp_name = fm.get("name", match.stem)
+        out_file = output_dir / f"{comp_name}.py"
+        out_file.write_text(stub, encoding="utf-8")
+        print(f"  Generated: {out_file.name}")
+
+
+def cmd_generate_all(vault: Path, output_dir: Path) -> None:
+    """Generate stubs for all components."""
+    comp_dir = vault / COMPONENTS_DIR
+    if not comp_dir.exists():
+        print(f"Components directory not found: {comp_dir}")
+        return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    count = 0
+
+    for f in comp_dir.rglob("*.md"):
+        fm = parse_frontmatter(f)
+        if not fm or not fm.get("name"):
+            continue
+
+        original_code = extract_original_code(f)
+        stub = generate_stub(fm, original_code)
+
+        comp_name = fm.get("name")
+        out_file = output_dir / f"{comp_name}.py"
+        out_file.write_text(stub, encoding="utf-8")
+        count += 1
+
+    print(f"Generated {count} stubs in {output_dir}")
+
+
+def cmd_status() -> None:
+    """Show pipeline status and future plans."""
+    print("""
+╔══════════════════════════════════════════════════════════════╗
+║                    AGFORSIM Pipeline Status                   ║
+╠══════════════════════════════════════════════════════════════╣
+║                                                               ║
+║  Phase 1: Extraction (CURRENT)                                ║
+║  ──────────────────────────────                               ║
+║  ✓ 1_scan.py     — Scan codebases, triage functions           ║
+║  ✓ 2_extract.py  — Extract to Obsidian markdown               ║
+║  ✓ 3_track.py    — Track progress, find patterns              ║
+║  ✓ 4_reconcile.py— Normalize parameter names                  ║
+║  ✓ 5_implement.py— Generate Python stubs                      ║
+║                                                               ║
+║  Phase 2: Testing & Simulation (PLANNED)                      ║
+║  ───────────────────────────────────────                      ║
+║  ○ 6_test.py     — Run unit tests on implemented stubs        ║
+║  ○ 7_ensemble.py — Run ensemble simulations                   ║
+║  ○ 8_report.py   — Generate analysis reports                  ║
+║                                                               ║
+║  Phase 2 requires:                                            ║
+║  • Implemented stubs (not just generated)                     ║
+║  • Test data fixtures                                         ║
+║  • Validation against original model outputs                  ║
+║                                                               ║
+║  Run 'python main.py status' for extraction progress.         ║
+║                                                               ║
+╚══════════════════════════════════════════════════════════════╝
+""")
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Step 5: Generate Python function stubs from components",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "name", nargs="?",
+        help="Component name to generate (partial match supported)",
+    )
+    parser.add_argument(
+        "--all", action="store_true",
+        help="Generate stubs for all components",
+    )
+    parser.add_argument(
+        "--status", action="store_true",
+        help="Show pipeline status",
+    )
+    parser.add_argument(
+        "--vault", type=Path, default=None,
+        help="Path to vault (defaults to ../)",
+    )
+    parser.add_argument(
+        "--output", type=Path, default=None,
+        help="Output directory for stubs",
+    )
+
     args = parser.parse_args()
-    
-    comp_dir = args.vault / "components"
-    out_dir = args.output or (args.vault / "src" / "agforsim" / "components" / "growth")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    
-    if args.name:
-        # Find specific component
-        matches = list(comp_dir.rglob(f"{args.name}*.md"))
-        if not matches:
-            print(f"Component not found: {args.name}")
-            return
-        
-        for match in matches:
-            fm = parse_frontmatter(match)
-            if fm:
-                stub = generate_stub(fm)
-                out_file = out_dir / f"{fm.get('name', 'unknown')}.py"
-                out_file.write_text(stub)
-                print(f"Wrote {out_file}")
-    
-    elif args.all:
-        for f in comp_dir.rglob("*.md"):
-            fm = parse_frontmatter(f)
-            if fm and fm.get("name"):
-                stub = generate_stub(fm)
-                out_file = out_dir / f"{fm['name']}.py"
-                out_file.write_text(stub)
-                print(f"Wrote {out_file}")
-    
+
+    if args.status:
+        cmd_status()
+        return
+
+    vault = resolve_vault(args.vault)
+    output_dir = args.output or (vault / OUTPUT_DIR / "stubs")
+
+    if args.all:
+        cmd_generate_all(vault, output_dir)
+    elif args.name:
+        cmd_generate(vault, args.name, output_dir)
     else:
         parser.print_help()
 
